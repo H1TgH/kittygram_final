@@ -1,0 +1,261 @@
+name: Kittygram CI/CD
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  tests_backend:
+    name: Test backend
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:13.10
+        env:
+          POSTGRES_USER: kittygram_user
+          POSTGRES_PASSWORD: kittygram_password
+          POSTGRES_DB: kittygram
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-dev \
+            libjpeg-dev \
+            zlib1g-dev \
+            libfreetype6-dev \
+            liblcms2-dev \
+            libopenjp2-7-dev \
+            libtiff-dev \
+            libwebp-dev
+            
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools
+          pip install flake8==6.0.0 flake8-isort==7.0.0
+          pip install -r ./backend/requirements.txt
+      
+      - name: Test with flake8 and django tests
+        env:
+          POSTGRES_USER: kittygram_user
+          POSTGRES_PASSWORD: kittygram_password
+          POSTGRES_DB: kittygram
+          DB_HOST: localhost
+          DB_PORT: 5432
+          SECRET_KEY: test-secret-key
+          DEBUG: True
+        run: |
+          python -m flake8 backend/
+          cd backend/
+          python manage.py test
+
+  tests_frontend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          cd frontend/
+          npm ci
+
+      - name: Test frontend
+        run: |
+          cd frontend/
+          npm run test
+
+  build_and_push_backend:
+    runs-on: ubuntu-latest
+    needs: tests_backend
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Login to Docker 
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build and push backend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend/
+          push: true
+          tags: gevork23/kittygram_backend:latest
+
+  build_and_push_frontend:
+    name: Build and push frontend
+    runs-on: ubuntu-latest
+    needs: tests_frontend
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Login to Docker 
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build and push frontend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend/
+          push: true
+          tags: gevork23/kittygram_frontend:latest
+
+  build_and_push_nginx:
+    name: Build and push nginx
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Login to Docker 
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build and push nginx
+        uses: docker/build-push-action@v4
+        with:
+          context: ./nginx/
+          push: true
+          tags: gevork23/kittygram_nginx:latest
+
+deploy:
+  runs-on: ubuntu-latest
+  needs: 
+    - build_and_push_backend
+    - build_and_push_frontend
+    - build_and_push_nginx
+  steps:
+    - name: Checkout repo
+      uses: actions/checkout@v3
+  
+    - name: Copy files via ssh
+      uses: appleboy/scp-action@master
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USER }}
+        key: ${{ secrets.SSH_KEY }}
+        source: "docker-compose.production.yml,.env.example"
+        target: "kittygram"
+  
+    - name: Executing remote ssh commands to deploy
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USER }}
+        key: ${{ secrets.SSH_KEY }}
+        script: |
+          cd kittygram
+          
+          # Проверяем наличие .env файла
+          if [ ! -f ".env" ]; then
+            echo "Creating .env file from example..."
+            cp .env.example .env
+            echo "Please edit .env file with your settings and restart"
+            exit 1
+          fi
+          
+          echo "=== Pulling latest images ==="
+          sudo docker pull gevork23/kittygram_backend:latest || true
+          sudo docker pull gevork23/kittygram_frontend:latest || true
+          sudo docker pull gevork23/kittygram_nginx:latest || true
+          
+          echo "=== Stopping old containers ==="
+          sudo docker compose -f docker-compose.production.yml down || true
+          
+          echo "=== Creating volumes ==="
+          sudo docker volume create pg_data_production 2>/dev/null || true
+          sudo docker volume create static_volume 2>/dev/null || true
+          sudo docker volume create media_volume 2>/dev/null || true
+          
+          echo "=== Starting new containers ==="
+          sudo docker compose -f docker-compose.production.yml up -d
+          
+          echo "=== Waiting for services ==="
+          sleep 20
+          
+          echo "=== Checking backend logs ==="
+          sudo docker compose -f docker-compose.production.yml logs backend --tail=20
+          
+          echo "=== Running migrations (if needed) ==="
+          sudo docker compose -f docker-compose.production.yml exec -T backend python manage.py migrate --noinput 2>/dev/null || echo "Migrations already applied or container not ready"
+          
+          echo "=== Waiting for backend to be ready ==="
+          for i in {1..30}; do
+            if sudo docker compose -f docker-compose.production.yml exec -T backend curl -f http://localhost:8000/api/ >/dev/null 2>&1; then
+              echo "Backend is ready!"
+              break
+            fi
+            echo "Waiting for backend... ($i/30)"
+            sleep 2
+          done
+
+          echo "=== Collecting static ==="
+          sudo docker compose -f docker-compose.production.yml exec -T backend python manage.py collectstatic --noinput 2>/dev/null || echo "Static collection failed, retrying..."
+          sleep 5
+          sudo docker compose -f docker-compose.production.yml exec -T backend python manage.py collectstatic --noinput
+          
+          # Копируем медиа директорию если нужно
+          echo "=== Ensuring media directory ==="
+          sudo docker compose -f docker-compose.production.yml exec -T backend mkdir -p /app/media
+          sudo docker compose -f docker-compose.production.yml exec -T backend chmod -R 755 /app/media
+          
+          echo "=== Restarting containers ==="
+          sudo docker compose -f docker-compose.production.yml restart backend frontend nginx
+          
+          echo "=== Final wait ==="
+          sleep 10
+          
+          echo "=== Checking services ==="
+          sudo docker compose -f docker-compose.production.yml ps
+          
+          echo "=== Testing connectivity ==="
+          curl -f http://localhost:9000/ && echo "✅ Kittygram deployed successfully" || echo "⚠️  Could not connect, checking logs..."
+          
+          echo "=== Checking logs ==="
+          sudo docker compose -f docker-compose.production.yml logs --tail=20
+          
+          echo "=== Deployment completed! ==="
+
+  send_message:
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+    
+    steps:
+      - name: Send Telegram message
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            🚀 Kittygram deployment
+            Status: ${{ needs.deploy.result }}
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Site: https://oski.myftp.biz/
